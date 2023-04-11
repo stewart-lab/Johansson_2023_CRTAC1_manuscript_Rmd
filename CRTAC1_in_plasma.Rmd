@@ -1,0 +1,246 @@
+---
+title: "Analysis of CRTAC1 levels in blood plasma"
+author: "Yury V Bukhman"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    toc: TRUE
+    toc_float: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Project: Johansson CRTAC1 paper 2023 \
+JIRA Ticket: BIOINFREQ-406. Final version of Johansson CRTAC1 data analysis + methods
+
+## Set-up
+
+1. Set working directory to the location of the R Markdown file
+2. Load libraries
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+```
+
+## Load the data
+Transform each dataset into one with the following variables: \
+1. sample_id
+2. patient_condition
+3. age
+4. log10_CRTAC1_nm
+
+### The hospital patients dataset
+Read in the data
+```{r}
+data1 <- read_csv("data/deIDed patient metadata and CRTAC1 ELISA for Ron & Yury 110922.csv")
+```
+
+Transmute into a tibble that has the columns we need
+```{r}
+hospital <- transmute(data1, sample_id = paste("hospital", sample_id, sep="_"), patient_condition = NA, age = Age_less_than_90, log10_CRTAC1_nm = log10(CRTAC1_ELISA_nM))
+```
+
+Compute the patient condition column
+```{r}
+hospital$patient_condition[data1$COVID == 0 & data1$ICU_1 == 0] = "hospital, no COVID, no ICU"
+hospital$patient_condition[data1$COVID == 0 & data1$ICU_1 == 1] = "hospital, no COVID, ICU"
+hospital$patient_condition[data1$COVID == 1 & data1$ICU_1 == 0] = "hospital, COVID, no ICU"
+hospital$patient_condition[data1$COVID == 1 & data1$ICU_1 == 1] = "hospital, COVID, ICU"
+```
+
+Display 3 random rows of data
+```{r}
+hospital %>% sample_n(3)
+```
+
+### The long COVID dataset
+Read in the data table and the two metadata tables
+```{r}
+data2_crtac1 <- read_csv("data/CRTAC1 ELISA H and LC updated 121922.csv")
+data2_meta1 <- read_csv("data/C NC PC T and LC 08172022 For Mats.csv")
+data2_meta2 <- read_csv("data/01042022 New LC Patient Data for Mats.csv")
+```
+
+Join the data and the metadata columns that we need
+```{r}
+data2_1 <- merge(data2_crtac1, select(data2_meta1, Sample, Age, Pulmonary_dis), by.x = "subject", by.y = "Sample") %>% rename(COPD = Pulmonary_dis)
+data2_2 <- merge(data2_crtac1, select(data2_meta2, Sample, Age), by.x = "subject", by.y = "Sample") %>% mutate(COPD = "N")
+long_covid <- rbind(data2_1, data2_2)
+```
+
+Transmute into a tibble that has the columns we need
+```{r}
+long_covid <- transmute(long_covid, sample_id = subject, patient_condition = NA, age = Age, COPD = COPD, log10_CRTAC1_nm = log10(CRTAC1_ELISA_nM))
+```
+
+Calculate the patient_condition variable
+```{r}
+long_covid$patient_condition[grep("H",long_covid$sample_id)] <- "healthy"
+long_covid$patient_condition[grep("LC",long_covid$sample_id)] <- "long COVID"
+long_covid$patient_condition[grepl("LC",long_covid$sample_id) & long_covid$COPD == "Y"] <- "long COVID + COPD"
+```
+
+Drop the COPD column
+```{r}
+long_covid <- long_covid %>% select(-COPD)
+```
+
+Display 3 random rows of data
+```{r}
+long_covid %>% sample_n(3)
+```
+
+### The COPD dataset
+Read in the data
+```{r}
+copd_crtac <- read_csv("data/COPD patients.csv")
+copd_ages <- read_csv("data/COPD Ages.csv")
+```
+Join CRTAC1 data to the metadata
+```{r}
+copd <- merge(copd_crtac, copd_ages, by.x = "Patient_No", by.y = "COPD_ID")
+```
+
+Transmute COPD data into a tibble with the columns that we need
+```{r}
+copd <- transmute(copd, sample_id = paste("copd", Patient_No, sep = "_"), patient_condition = "COPD", age = Age, log10_CRTAC1_nm = log10(CRTAC1_ELISA_nM))
+```
+
+Display 3 random rows of data
+```{r}
+copd %>% sample_n(3)
+```
+
+### Concatenate the 3 datasets
+```{r}
+crtac1 <- rbind(hospital,long_covid,copd)
+crtac1 %>% sample_n(3)
+```
+
+Transform patient_condition into a factor and summarize the dataset
+```{r}
+crtac1$patient_condition <- factor(crtac1$patient_condition, levels = c("healthy", "COPD", "long COVID", "long COVID + COPD", "hospital, no COVID, no ICU", "hospital, no COVID, ICU", "hospital, COVID, no ICU", "hospital, COVID, ICU"))
+summary(crtac1)
+```
+
+## Exploratory data analysis
+Mean age and CRTAC1 level in each patient condition, ordered by the mean CRTAC1 level, descending.
+```{r}
+crtac1 %>%
+  group_by(patient_condition) %>%
+  summarise(mean_age = mean(age),
+             mean_crtac1 = mean(log10_CRTAC1_nm)) %>% 
+  arrange(desc(mean_crtac1))
+```
+
+Define "normal range" as mean +- 3 sd of the healthy controls. Compute upper and lower bounds of this range.
+```{r}
+norm_mean <- crtac1 %>% filter(patient_condition == "healthy") %>% summarise(mean(log10_CRTAC1_nm)) %>% unlist()
+norm_sd <- crtac1 %>% filter(patient_condition == "healthy") %>% summarise(sd(log10_CRTAC1_nm)) %>% unlist()
+norm_low <- norm_mean - 3*norm_sd
+norm_high <- norm_mean + 3*norm_sd
+```
+
+
+Plot CRTAC1 level vs. age for each patient condition, marking the normal mean and range as dashed horizontal lines
+```{r}
+ggplot(crtac1, aes(x = age, y = log10_CRTAC1_nm)) + 
+  geom_point() + geom_smooth(method = "lm") + 
+  geom_hline(yintercept = norm_mean, col = "red", lty = 2) + 
+  geom_hline(yintercept = norm_low, col = "red", lty = 2) +
+  geom_hline(yintercept = norm_high, col = "red", lty = 2) +
+  facet_wrap(~ patient_condition, nrow = 2)
+```
+
+COVID and, to a lesser extent, COPD both seem to correlate with lower CRTAC1. Many long COVID patients, almost half of the hospital patients with COVID, and the majority of COVID patients in ICU have CRTAC1 levels below the normal range. Additionally, CRTAC1 levels tend to trend slightly upwards with age in most patient groups. Finally, CRTAC1 levels vary widely among individuals in each group.
+
+## A linear model accounting for patient condition and age
+
+```{r}
+lm1 <- lm(log10_CRTAC1_nm ~ patient_condition + age, data = crtac1)
+summary(lm1)
+```
+The negative effects of COPD, acute form of COVID, and ICU on CRTAC1 levels are all statistically significant, with the COVID+ICU being the strongest. The long COVID term is borderline-significant, with p value of 0.07. There is also a statistically significant positive effect of the patient's age. Age patient condition explain about half of all the variance in this dataset.
+
+### Diagnostic plots
+```{r}
+plot(lm1)
+```
+There is a slight deviation from normality, with higher values tending to have lower variance. However, this is not bad enough to cause a major concern. Additionally, there are no high-leverage outliers in the data.
+
+## Explore contrasts
+Compute estimated marginal means (EMMs)
+```{r}
+library(emmeans)
+emms = emmeans(lm1, "patient_condition")
+emms
+```
+
+Plot EMMS of each patient condition at the average age of 56.8
+```{r}
+plot(ref_grid(lm1))
+```
+
+Interaction plot of the EMMs
+```{r}
+emmip(ref_grid(lm1, cov.reduce = FALSE), patient_condition ~ age)
+```
+
+Statistical significance of certain contrasts
+```{r}
+Contrasts = list(COPD_vs_Healthy                = c(-1,  1, 0, 0, 0, 0, 0, 0),
+                 Long_COVID_vs_Healthy          = c(-1,  0, 1, 0, 0, 0, 0, 0),
+                 Long_COVID_and_COPD_vs_Healthy = c(-1,  0, 0, 1, 0, 0, 0, 0)
+                 )
+contrast(emms, Contrasts, adjust="sidak")
+```
+## A subset of long COVID patients have abnormally low levels of CRTAC1
+Although the mean CRTAC1 level in long COVID patients may not be significantly different from healthy controls under the normal distribution assumption, the distribution in this group deviates from normality and there is a subset of patients with abnormally low CRTAC1 levels
+
+Violin plots of the CRTAC1 distributions show that the mode of the long COVID data is nearly identical to that of the healthy controls. However, the former is skewed, with long lower tail.
+```{r}
+ggplot(filter(crtac1, patient_condition %in% c("healthy", "long COVID")), aes(x = patient_condition, y = log10_CRTAC1_nm)) + geom_violin() + geom_jitter(width = 0.2) +
+  geom_hline(yintercept = norm_mean, col = "red", lty = 2) + 
+  geom_hline(yintercept = norm_low, col = "red", lty = 2) +
+  geom_hline(yintercept = norm_high, col = "red", lty = 2)
+```
+
+A normal QQ plot also indicates that the CTRAC1 distribution in long COVID patients is skewed.
+```{r}
+qqnorm((filter(crtac1, patient_condition == "long COVID")$log10_CRTAC1_nm), 
+       main = "Normal Q-Q Plot of log-transformed data, long COVID")
+qqline(filter(crtac1, patient_condition == "long COVID")$log10_CRTAC1_nm)
+```
+
+The Shapiro-Wilk test also indicates that the CRTAC1 distribution in long COVID patients significantly deviates from the normal
+```{r}
+crtac1 %>% group_by(patient_condition) %>% summarise(Shapiro_Wilk_pval = shapiro.test(log10_CRTAC1_nm)$p.value)
+```
+
+It's worth noting that most groups of COVID patients significantly deviate from normality, indicating the presence of subsets of patients with particularly low levels. 
+```{r}
+ggplot(filter(crtac1, patient_condition %in% c("long COVID","hospital, COVID, no ICU","hospital, COVID, ICU")), aes(x = patient_condition, y = log10_CRTAC1_nm)) + geom_violin() + geom_jitter(width = 0.2) +
+  geom_hline(yintercept = norm_mean, col = "red", lty = 2) + 
+  geom_hline(yintercept = norm_low, col = "red", lty = 2) +
+  geom_hline(yintercept = norm_high, col = "red", lty = 2)
+```
+
+The long COVID + COPD group is at least somewhat skewed as well. The most likely reason that it doesn't appear statistically significant by the Shapiro-Wilk test is that it has only 16 patients. In contrast, the non-COVID groups are much less skewed, if at all. Here are the violin plots of all patient groups in the dataset.
+```{r}
+ggplot(crtac1, aes(x = patient_condition, y = log10_CRTAC1_nm)) + geom_violin() + geom_jitter(width = 0.2) +
+  geom_hline(yintercept = norm_mean, col = "red", lty = 2) + 
+  geom_hline(yintercept = norm_low, col = "red", lty = 2) +
+  geom_hline(yintercept = norm_high, col = "red", lty = 2) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Display session info
+```{r}
+sessionInfo()
+```
+```
+
